@@ -1,104 +1,114 @@
 # Lab08: locks
 
-## Barrier Implementation Using Pthreads (Moderate)
+以下是关于 xv6 内存分配器改进的实验报告：
 
-### 1) 实验目的
+---
 
-本实验的目标是实现一个线程屏障（barrier），在该屏障点，所有参与的线程必须等待直到所有其他线程也到达该点。你将使用 pthread 条件变量来实现这一点，它们是线程同步的工具。
+## 实验报告：多核环境下的内存分配器优化
 
-### 2) 实验步骤
+### 1. 实验目的
 
-#### 1. 理解现有代码
+本实验旨在优化 xv6 操作系统的内存分配器，以减少多核环境下的锁争用现象。原有的内存分配器使用一个全局自由列表（free list），由单个锁保护，导致在高并发情况下产生严重的锁争用问题。通过实现每个 CPU 一个自由列表，并在需要时允许 CPU 之间窃取（steal）内存块，可以提高并行度，降低锁争用，从而提升系统性能。
 
-1. **查看 `barrier.c` 的代码**：
-   - 找到 `struct barrier` 的定义以及 `barrier_init` 函数的实现。
-   - 确定 `barrier` 函数需要完成的任务。
+kalloctest 中锁争用的根本原因是 kalloc() 有一个单独的空闲列表，由一个锁保护。为了消除锁争用，你需要重新设计内存分配器，以避免单一的锁和列表。基本思路是为每个 CPU 维护一个空闲列表，每个列表有自己的锁。不同 CPU 上的分配和释放可以并行运行，因为每个 CPU 都在操作不同的列表。
 
-2. **分析当前 `barrier` 函数的缺陷**：
-   - **断言失败**：如果线程在所有其他线程到达屏障之前就离开了屏障，程序将触发断言错误。这表明屏障的实现存在问题。
+### 3. 实验步骤
 
-#### 2. 实现屏障功能
+#### 2. 修改内存分配器
 
-1. **修改 `barrier.c` 中的 `barrier` 函数**：
-   - 你需要确保每个线程在调用 `barrier` 时，直到所有参与的线程都到达屏障后，才允许线程继续执行。
-   - 使用 `pthread_cond_wait` 和 `pthread_cond_broadcast` 实现线程同步。
+1. **分配每个 CPU 一个自由列表**：
+   在 `kalloc.c` 中，为每个 CPU 创建一个独立的自由列表和对应的锁。
 
    ```c
-   #include <pthread.h>
-   #include <stdio.h>
-   #include <stdlib.h>
-   #include <assert.h>
-   #include <unistd.h>
+   struct {
+       struct spinlock lock;
+       struct run *freelist;
+   } kmem[NCPU];
+   ```
 
-   struct barrier {
-       pthread_mutex_t mutex;
-       pthread_cond_t cond;
-       int count;      // 当前到达屏障的线程数
-       int threshold;  // 总线程数
-       int round;      // 当前轮次
-   };
+2. **修改 `freerange` 函数**：
+   将所有空闲内存块分配给当前运行 `freerange` 的 CPU。
 
-   void barrier_init(struct barrier *b, int n) {
-       pthread_mutex_init(&b->mutex, NULL);
-       pthread_cond_init(&b->cond, NULL);
-       b->count = 0;
-       b->threshold = n;
-       b->round = 0;
+   ```c
+   void freerange(void *vstart, void *vend) {
+       char *p;
+       p = (char*)PGROUNDUP((uint64)vstart);
+       for(; p + PGSIZE <= (char*)vend; p += PGSIZE)
+           kfree(p);
+   }
+   ```
+
+3. **修改 `kalloc` 和 `kfree` 函数**：
+   - `kalloc` 从当前 CPU 的自由列表中分配内存，如果当前列表为空，则尝试从其他 CPU 窃取内存。
+   - `kfree` 将释放的内存块加入当前 CPU 的自由列表。
+
+   ```c
+   void kfree(void *pa) {
+       struct run *r = (struct run*)pa;
+       push_off();
+       int id = cpuid();
+       acquire(&kmem[id].lock);
+       r->next = kmem[id].freelist;
+       kmem[id].freelist = r;
+       release(&kmem[id].lock);
+       pop_off();
    }
 
-   void barrier(struct barrier *b) {
-       pthread_mutex_lock(&b->mutex);
-
-       int round = b->round;
-       b->count++;
-       
-       if (b->count == b->threshold) {
-           b->round++;
-           b->count = 0;  // 准备下一个轮次
-           pthread_cond_broadcast(&b->cond);  // 唤醒所有线程
-       } else {
-           while (round == b->round) {
-               pthread_cond_wait(&b->cond, &b->mutex);  // 等待其他线程
-           }
+   void* kalloc(void) {
+       push_off();
+       int id = cpuid();
+       acquire(&kmem[id].lock);
+       struct run *r = kmem[id].freelist;
+       if(r)
+           kmem[id].freelist = r->next;
+       release(&kmem[id].lock);
+       if(r) {
+           pop_off();
+           memset((char*)r, 5, PGSIZE); // fill with junk
+           return (void*)r;
        }
 
-       pthread_mutex_unlock(&b->mutex);
+       // Try to steal from other CPUs
+       for(int i = 0; i < NCPU; i++) {
+           if(i == id) continue;
+           acquire(&kmem[i].lock);
+           r = kmem[i].freelist;
+           if(r) {
+               kmem[i].freelist = r->next;
+               release(&kmem[i].lock);
+               pop_off();
+               memset((char*)r, 5, PGSIZE); // fill with junk
+               return (void*)r;
+           }
+           release(&kmem[i].lock);
+       }
+       pop_off();
+       return 0;
    }
    ```
 
-2. **重新编译并测试**：
-   - 编译并运行程序，检查屏障是否在不同线程数量下工作正常。
-   ```bash
-   make barrier
-   ./barrier 1
-   ./barrier 2
-   ./barrier 3
-   ```
 
-3. **确保代码通过测试**：
-   - 使用 `make grade` 命令运行所有测试，确保屏障的实现能够通过所有测试用例。
+### 3. 遇到的困难
 
-   ```bash
-   make grade
-   ```
+这个实验目标是把每个cpu设置一个空闲列表，同时要求当自己的空闲列表不够的时候从其他cpu的空闲列表获取，然后如何获取我不是很清楚，查看了他那个books，知道可以允许不同
+CPU 之间共享内存池的方式可以很好解决这个问题， 首先， 获取当前 CPU 的 ID。
+尝试从当前 CPU 的空闲列表中获取空闲块， 如果成功则直接返回。如果当前 CPU
+的空闲列表为空， 则遍历其他所有 CPU 的空闲列表， 尝试借用其中的空闲块。
+如果找到了空闲块， 则将其从其他 CPU 的空闲列表中移除， 并加入到当前 CPU
+的空闲列表中， 然后返回。
 
-### 3) 实验中遇到的困难和解决办法
+### 4. 实验结果
 
-1. **处理线程竞争和同步**：
-   - **困难描述**：需要确保线程在屏障点正确同步，避免数据竞争。
-   - **解决办法**：使用互斥锁和条件变量来管理线程同步，确保所有线程在屏障点正确等待和通知。
+改进后的内存分配器显著减少了 `kmem` 锁的争用，具体表现为 `#fetch-and-add` 值大幅降低。以下是实验前后的对比：
 
-2. **轮次管理**：
-   - **困难描述**：处理多轮次屏障时，确保线程在正确的轮次同步。
-   - **解决办法**：在每次屏障到达时更新轮次计数，并确保线程在其轮次结束时被唤醒。
+- 实验前 `kmem` 锁争用次数：83375
+- 实验后 `kmem` 锁争用次数：0
 
-3. **调试和验证**：
-   - **困难描述**：调试多线程程序可能会遇到难以复现的错误。
-   - **解决办法**：使用调试工具（如 `gdb`）逐步检查线程状态和屏障实现，确保线程在屏障点正确等待和释放。
+所有用户测试均通过，表明改进后的内存分配器在性能提升的同时，仍能正确执行内存分配和释放操作。
 
-### 4) 实验心得
+### 5. 实验总结
 
-通过本次实验，我深入理解了线程同步机制和条件变量的使用。实现线程屏障让我掌握了如何管理多个线程在特定点的同步，避免了数据竞争和状态不一致的问题。通过对条件变量和互斥锁的实际应用，我提高了在多线程编程中的同步和协调能力。这些技能在实际开发中对于构建稳定和高效的并发程序至关重要。
+通过本次实验，我实现了一个多核环境下的高效内存分配器，解决了单锁引起的高并发争用问题。实验表明，通过将自由列表分配到每个 CPU 并在需要时允许窃取内存块，可以有效降低锁争用，提高系统性能。这种设计思路对多核系统中其他资源的管理也有一定的参考价值。
 
 ## Buffer cache (hard)
 
@@ -193,11 +203,11 @@
 ### 3) 实验中遇到的困难和解决办法
 
 1. **处理锁竞争和同步**：
-   - **困难描述**：需要确保不同线程对缓冲区块的访问不会引发锁竞争。
-   - **解决办法**：使用哈希表和桶锁来管理不同缓冲区块的访问，减少全局锁的竞争。
+   - **困难描述**：一开始不知道怎么减少缓存块锁的冲突。
+   - **解决办法**：后来了解到可以根据数据块的 blocknumber将其保存进一个哈希表， 哈希表的每个 bucket 都有一个相应的锁来保护。
 
 2. **处理哈希冲突**：
-   - **困难描述**：缓冲区块可能哈希到相同的桶中，引发锁冲突。
+   - **困难描述**：然后就是他这个块缓存是由一个包含多个缓存块的链表组成的，将双向链表代码的编写也是比较复杂的， 我当时做的时候这个地方卡了蛮久的。
    - **解决办法**：调整桶的数量和哈希算法，确保哈希冲突尽可能减少。
 
 3. **调试和验证**：
